@@ -1,0 +1,40 @@
+{
+  "name": "savage-md-bot",
+  "version": "3.3.3",
+  "description": "SAVAGE MD V3.3.3 - Telegram Control Panel for WhatsApp Multi-Device Group Management Bot",
+  "main": "index.js",
+  "author": "Savage Ec",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "install:prod": "npm install --omit=dev --no-audit --no-fund"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "winston": "^3.13.1",
+    "winston-daily-rotate-file": "^5.0.0",
+    "@whiskeysockets/baileys": "npm:@itsliaaa/baileys@0.3.18-final",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4",
+    "link-preview-js": "3.2.0",
+    "ffmpeg-static": "^5.2.0"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "whatsapp",
+    "control-panel",
+    "savage",
+    "baileys",
+    "group-management"
+  ],
+  "optionalDependencies": {
+    "sharp": "^0.33.5"
+  }
+}

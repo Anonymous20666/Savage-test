@@ -1,0 +1,12 @@
+# runtime / generated
+node_modules/
+database/
+logs/
+sessions/
+installed/
+*.log
+tests/*.log
+.env.local
+
+# OS noise
+.DS_Store
