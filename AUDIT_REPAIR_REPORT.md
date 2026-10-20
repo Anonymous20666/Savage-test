@@ -1,6 +1,6 @@
 # SAVAGE MD V3.3.3 — Deep Audit, Targeted Repair & Regression Protection
 
-**Repository:** `Anonymous20666/Savage-test` · **Branch:** `arena/fff9d7ec-savage-test`
+**Repository:** `Anonymous20666/Savage-test` · **Branch:** `pappy/fff9d7ec-savage-test`
 **Project:** `SAVAGE MD V3.3.3/` (Telegram control panel for a WhatsApp Multi-Device group-management bot: telegraf + express + SQLite (`node:sqlite`) + Baileys fork `@whiskeysockets/baileys` → `@itsliaaa/baileys@0.3.18-final`)
 **Date:** 2026-10-20
 **Scope:** repair of an existing system — no redesign, no command removed/renamed/changed, smallest compatible fixes only.
