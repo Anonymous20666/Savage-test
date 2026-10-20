@@ -4488,8 +4488,13 @@ var require_sessions = __commonJS({
   INSERT INTO whatsapp_sessions (session_id, owner_telegram_id, phone_number, status, created_at)
   VALUES (@session_id, @owner_telegram_id, @phone_number, @status, datetime('now'))
   ON CONFLICT(session_id) DO UPDATE SET
-    phone_number = excluded.phone_number,
-    status = excluded.status
+    -- Keep ownership and phone stable across status-only updates: a repair,
+    -- restart or supervisor restore must never orphan a session by blanking
+    -- its phone or by leaving a stale/NULL owner in place when a real owner
+    -- is supplied (that made a paired session invisible to its own owner).
+    phone_number = COALESCE(excluded.phone_number, whatsapp_sessions.phone_number),
+    status = excluded.status,
+    owner_telegram_id = COALESCE(excluded.owner_telegram_id, whatsapp_sessions.owner_telegram_id)
 `);
     var setStatusStmt = db.prepare(`
   UPDATE whatsapp_sessions
@@ -4799,7 +4804,17 @@ var require_serialize = __commonJS({
     var { isGroupJid, normalizeJid } = require_jid();
     var { withChannelBrand } = require_channelBrand();
     var VIEW_ONCE_KEYS = ["viewOnceMessage", "viewOnceMessageV2", "viewOnceMessageV2Extension"];
-    var WRAPPER_KEYS = [...VIEW_ONCE_KEYS, "ephemeralMessage", "documentWithCaptionMessage"];
+    // Group Status / spoiler wrappers (added by the Baileys fork on send:
+    // `groupStatus: true` wraps the content in groupStatusMessageV2) carry a
+    // normal inner message and must be unwrapped before body/type extraction,
+    // otherwise incoming Group Status posts — and replies quoting one — are
+    // seen as type "groupStatusMessageV2" with an empty body and every command,
+    // anti-* detector and quoted-content flow silently skips them. The status
+    // MENTION wrappers (statusMentionMessage / groupStatusMentionMessage) are
+    // deliberately NOT unwrapped here: they carry only a protocolMessage stub,
+    // and antigroupstatus.js detects them from the raw envelope keys.
+    var STATUS_WRAPPER_KEYS = ["groupStatusMessage", "groupStatusMessageV2", "spoilerMessage"];
+    var WRAPPER_KEYS = [...VIEW_ONCE_KEYS, ...STATUS_WRAPPER_KEYS, "ephemeralMessage", "documentWithCaptionMessage"];
     function unwrapMessage(message) {
       if (!message) return message;
       const type = Object.keys(message)[0];
@@ -13836,8 +13851,10 @@ var require_linkPreview = __commonJS({
     var pfpCache = require_pfpCache();
     var URL_RE = /https?:\/\/[^\s<>]+/i;
     var getUrlInfo = null;
+    var extractImageThumb = null;
+    var prepareWAMessageMedia = null;
     try {
-      ({ getUrlInfo } = require("@whiskeysockets/baileys"));
+      ({ getUrlInfo, extractImageThumb, prepareWAMessageMedia } = require("@whiskeysockets/baileys"));
     } catch (_) {
       getUrlInfo = null;
     }
@@ -13850,26 +13867,67 @@ var require_linkPreview = __commonJS({
     function sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
     }
+    // jpegThumbnail must be a small JPEG. Profile pictures fetched from
+    // WhatsApp's CDN can be large PNG/JPEG files, and pasting those raw bytes
+    // into `jpegThumbnail` makes WhatsApp drop the preview image (the card
+    // shows title/description only). This mirrors the working reference
+    // implementation inside the Baileys fork (its own getUrlInfo() compresses
+    // with extractImageThumb before attaching a thumbnail): resize to a small
+    // JPEG, and fall back to the raw buffer only if no image library exists.
+    async function toJpegThumbnail(rawBuffer) {
+      if (!rawBuffer || typeof extractImageThumb !== "function") return rawBuffer;
+      try {
+        const { buffer } = await extractImageThumb(rawBuffer, 192);
+        return buffer || rawBuffer;
+      } catch (_) {
+        return rawBuffer;
+      }
+    }
+    // Large preview image ("Status-size rendering", see plugins/owner/debuglink.js).
+    // Same flow as the fork's getUrlInfo(): upload as a thumbnail-link through
+    // the session's waUploadToServer and attach the resulting imageMessage as
+    // highQualityThumbnail. Best-effort — the small JPEG above still renders
+    // the bubble preview if this fails or the socket has no uploader.
+    async function uploadHighQualityThumbnail(sock2, pictureUrl) {
+      if (!pictureUrl || typeof prepareWAMessageMedia !== "function") return void 0;
+      const upload = typeof sock2?.waUploadToServer === "function" ? sock2.waUploadToServer.bind(sock2) : null;
+      if (!upload) return void 0;
+      try {
+        const { imageMessage } = await prepareWAMessageMedia(
+          { image: { url: pictureUrl } },
+          { upload, mediaTypeOverride: "thumbnail-link", options: { timeout: 15e3 } }
+        );
+        return imageMessage || void 0;
+      } catch (err) {
+        logger2.warn("[whatsapp] link preview high-quality thumbnail upload failed (small JPEG preview still attached)", { error: err.message });
+        return void 0;
+      }
+    }
     async function fetchThumbnailBuffer(url, cacheKey) {
       if (!url) return void 0;
       const buffer = await pfpCache.getOrFetchPfp(cacheKey, url);
       if (!buffer) {
         logger2.warn("[whatsapp] link preview thumbnail fetch failed (preview still shows title/description)", { url });
+        return void 0;
       }
-      return buffer;
+      return toJpegThumbnail(buffer);
     }
     async function buildGroupLinkPreview(sock2, url) {
       const inviteCode = extractInviteCode(url);
       if (!inviteCode) return void 0;
       const info = await validateGroupInvite(sock2, inviteCode).catch(() => null);
       if (!info || info.status !== "active") return void 0;
-      const jpegThumbnail = await fetchThumbnailBuffer(info.pictureUrl, info.groupId);
+      const [jpegThumbnail, highQualityThumbnail] = await Promise.all([
+        fetchThumbnailBuffer(info.pictureUrl, info.groupId),
+        uploadHighQualityThumbnail(sock2, info.pictureUrl)
+      ]);
       return {
         "canonical-url": url,
         "matched-text": url,
         title: info.subject || "WhatsApp Group",
         description: `${typeof info.memberCount === "number" ? info.memberCount : "Unknown"} members \u2022 Tap to join`,
-        ...jpegThumbnail ? { jpegThumbnail } : {}
+        ...jpegThumbnail ? { jpegThumbnail } : {},
+        ...highQualityThumbnail ? { highQualityThumbnail } : {}
       };
     }
     async function buildChannelLinkPreview(sock2, url) {
@@ -13877,14 +13935,18 @@ var require_linkPreview = __commonJS({
       if (!inviteCode) return void 0;
       const preview = await resolveChannelPreview(sock2, inviteCode).catch(() => null);
       if (!preview || preview.status !== "active") return void 0;
-      const jpegThumbnail = await fetchThumbnailBuffer(preview.pictureUrl, preview.jid);
+      const [jpegThumbnail, highQualityThumbnail] = await Promise.all([
+        fetchThumbnailBuffer(preview.pictureUrl, preview.jid),
+        uploadHighQualityThumbnail(sock2, preview.pictureUrl)
+      ]);
       const description = preview.description || (typeof preview.subscribers === "number" ? `${preview.subscribers} subscribers` : "WhatsApp Channel");
       return {
         "canonical-url": url,
         "matched-text": url,
         title: preview.name || "WhatsApp Channel",
         description,
-        ...jpegThumbnail ? { jpegThumbnail } : {}
+        ...jpegThumbnail ? { jpegThumbnail } : {},
+        ...highQualityThumbnail ? { highQualityThumbnail } : {}
       };
     }
     async function fetchGenericPreview(sock2, url, attempt = 0) {
@@ -15420,9 +15482,22 @@ Format: 2348140825959 \u2014 digits only, no "+" prefix.`
         const currentSession = sessionsModel.listSessions().find((s) => s.session_id === sessionId);
         const ownerTelegramId = currentSession?.owner_telegram_id || null;
         const existing = sessionsModel.findSessionByOwnerAndPhone(ownerTelegramId, phoneNumber);
-        const newSessionId = existing?.session_id || sessionIdFor(ownerTelegramId || sessionId || "wa", phoneNumber);
         const foreign = sessionsModel.findSessionsByPhone(phoneNumber).find((s) => Number(s.owner_telegram_id) !== Number(ownerTelegramId));
         if (foreign && !isOwner(ownerTelegramId)) return void m2.reply("\u26D4 That WhatsApp number is already assigned to another user.");
+        // A number/session belongs to exactly ONE bot instance (master or a
+        // clone) — the same rule commands/pair.js enforces via
+        // resolvePairingSession(). WA-side .pair runs outside the Telegram
+        // AsyncLocalStorage scope, so the instance is derived from the session
+        // that issued the command; without this, a clone pairing a number
+        // created the session in the MASTER's namespace (tg... instead of
+        // clone_xxx__tg...), and the two bots then fought over one account.
+        const cloneOfSession = require_cloneRuntime().cloneOfSession;
+        const curInstance = cloneOfSession(sessionId) || null;
+        if (existing && (cloneOfSession(existing.session_id) || null) !== curInstance) {
+          return void m2.reply("\u26D4 That WhatsApp number is already linked to a different bot instance.");
+        }
+        const baseId = existing?.session_id || sessionIdFor(ownerTelegramId || sessionId || "wa", phoneNumber);
+        const newSessionId = existing?.session_id || (curInstance ? `${curInstance}__${baseId}` : baseId);
         await m2.reply(`\u{1F504} Starting pairing for ${phoneNumber}...
 
 Please wait...`);
@@ -18827,7 +18902,19 @@ var require_waGroupEvents = __commonJS({
       }
     }, 5 * 60 * 1e3).unref();
     function registerGroupEvents(sock2, sessionId) {
+      // Every handler below must only act for the socket that CURRENTLY owns
+      // this session. A superseded socket (pairing retry, reconnect) can still
+      // emit buffered events; processing them would duplicate welcome/goodbye
+      // messages and anti-delete reposts and blur session isolation.
+      function isCurrentSock() {
+        try {
+          return require_bot().waManager.getSocket(sessionId) === sock2;
+        } catch (_) {
+          return true;
+        }
+      }
       sock2.ev.on("group-participants.update", async (update) => {
+        if (!isCurrentSock()) return;
         const { id: groupJid, participants, action } = update;
         try {
           require_extBridge().get().protect.handleUpdate(sock2, sessionId, update).catch(() => {
@@ -18864,9 +18951,11 @@ var require_waGroupEvents = __commonJS({
         }
       });
       sock2.ev.on("messages.upsert", ({ messages }) => {
+        if (!isCurrentSock()) return;
         for (const rawMsg of messages) cacheMessage(rawMsg, sessionId);
       });
       sock2.ev.on("messages.update", async (updates) => {
+        if (!isCurrentSock()) return;
         for (const update of updates) {
           try {
             const isRevoke = update.update?.message === null || update.update?.messageStubType === "REVOKE";
@@ -25951,6 +26040,26 @@ var require_bot = __commonJS({
       const next = socketInitQueue.shift();
       if (next) next();
     }
+    // Per-session serialisation: createSession(), the pairing-code retry
+    // rebuild and reconnect rebuilds all touch the SAME session's socket,
+    // listeners and auth state. Without a per-session lock, two of those can
+    // interleave and leave two live sockets for one session (both writing
+    // creds.json — the classic "pairing works, then randomly dies" failure).
+    // The lock is scoped to ONE sessionId, so different users still pair
+    // fully concurrently; only operations on the same session queue.
+    var sessionOps = /* @__PURE__ */ new Map();
+    function withSessionLock(sessionId, fn) {
+      const key = String(sessionId);
+      const prev = sessionOps.get(key) || Promise.resolve();
+      const run = prev.then(fn, fn);
+      const tail = run.then(() => {
+      }, () => {
+      }).then(() => {
+        if (sessionOps.get(key) === tail) sessionOps.delete(key);
+      });
+      sessionOps.set(key, tail);
+      return run;
+    }
     var telegramBotRef = null;
     function setTelegramBot(bot) {
       telegramBotRef = bot;
@@ -26115,9 +26224,14 @@ SAVAGE MD V3.3.3 is ready.`;
       }
     }
     async function requestPairingCodeWithRetry(sessionId, phoneNumber, onPairingCode, attempt = 1) {
+      const started = sockets.get(sessionId);
+      if (!started?.sock) throw new Error("Session socket no longer exists.");
+      await sleep(attempt === 1 ? 3e3 : PAIRING_CODE_RETRY_DELAY_MS);
+      // The session may have been rebuilt or removed while we slept — always
+      // talk to the socket that is CURRENTLY registered for this sessionId,
+      // never to the captured (possibly superseded) one.
       const entry = sockets.get(sessionId);
       if (!entry?.sock) throw new Error("Session socket no longer exists.");
-      await sleep(attempt === 1 ? 3e3 : PAIRING_CODE_RETRY_DELAY_MS);
       try {
         const cleanNumber = String(phoneNumber).replace(/[^0-9]/g, "");
         const code = await entry.sock.requestPairingCode(cleanNumber);
@@ -26127,7 +26241,20 @@ SAVAGE MD V3.3.3 is ready.`;
       } catch (err) {
         logger2.warn("waManager: pairing code request failed", { sessionId, attempt, error: err.message });
         if (attempt >= PAIRING_CODE_MAX_ATTEMPTS) throw err;
-        await buildSocket(sessionId, { phoneNumber, ownerTelegramId: entry.ownerTelegramId, onPairingCode });
+        await withSessionLock(sessionId, async () => {
+          // Dispose the failing socket BEFORE rebuilding, so a retry can never
+          // leave a second live socket (and a second creds writer) behind.
+          const cur = sockets.get(sessionId);
+          const old = cur?.sock;
+          if (old) {
+            disposeSocket(old);
+            try {
+              await old.end(void 0);
+            } catch (_) {
+            }
+          }
+          await buildSocket(sessionId, { phoneNumber, ownerTelegramId: entry.ownerTelegramId, onPairingCode });
+        });
         return requestPairingCodeWithRetry(sessionId, phoneNumber, onPairingCode, attempt + 1);
       }
     }
@@ -26213,10 +26340,12 @@ SAVAGE MD V3.3.3 is ready.`;
       entry.reconnectTimer = setTimeout(async () => {
         entry.reconnectTimer = null;
         if (intentionallyDisconnected.has(sessionId)) return;
-        const cur = sockets.get(sessionId);
-        if (cur && cur.sock !== oldSock) return;
         try {
-          await buildSocket(sessionId, { ownerTelegramId: entry.ownerTelegramId, onStatus });
+          await withSessionLock(sessionId, async () => {
+            const cur = sockets.get(sessionId);
+            if (cur && cur.sock !== oldSock) return;
+            await buildSocket(sessionId, { ownerTelegramId: entry.ownerTelegramId, onStatus });
+          });
         } catch (err) {
           entry.reconnectAttempts += 1;
           const next = Math.min(RECONNECT_BASE_MS * 2 ** Math.min(entry.reconnectAttempts, 6), RECONNECT_MAX_MS);
@@ -26298,7 +26427,14 @@ SAVAGE MD V3.3.3 is ready.`;
           logger2.warn("waManager: baileys event-bus error", { sessionId, error: err?.message || String(err) });
         });
       }
-      sock2.ev.on("creds.update", saveCreds);
+      sock2.ev.on("creds.update", (...args) => {
+        // Isolation guard: a superseded/stale socket must never write auth
+        // state for a session that a newer socket now owns. Each session has
+        // exactly one active creds writer; cross-session dirs are already
+        // separate via authDir(sessionId).
+        if (sockets.get(sessionId)?.sock !== sock2) return;
+        return saveCreds(...args);
+      });
       sock2.ev.on("call", async (calls) => {
         if (sockets.get(sessionId)?.sock !== sock2) return;
         try {
@@ -26560,7 +26696,13 @@ AutoJoin stays OFF until you turn it back on \u2014 run /autojoin on to resume.`
         staleThresholdMs: WATCHDOG_STALE_MS
       });
     }
-    async function createSession({ sessionId, phoneNumber, ownerTelegramId, onPairingCode, onStatus } = {}) {
+    function createSession(opts) {
+      // Serialised per session: two overlapping /pair attempts (or a /pair
+      // racing a reconnect) for the SAME session must not interleave socket
+      // builds. Different sessions run fully concurrently.
+      return withSessionLock(opts?.sessionId, () => createSessionUnlocked(opts));
+    }
+    async function createSessionUnlocked({ sessionId, phoneNumber, ownerTelegramId, onPairingCode, onStatus } = {}) {
       if (!sessionId) throw new Error("sessionId is required");
       intentionallyDisconnected.delete(sessionId);
       const existing = sockets.get(sessionId);
@@ -26569,6 +26711,10 @@ AutoJoin stays OFF until you turn it back on \u2014 run /autojoin on to resume.`
         return { success: true, alreadyConnected: true };
       }
       if (existing?.sock && existing.status !== "connected") {
+        // Remove listeners FIRST so the dying socket cannot emit one more
+        // creds.update/connection.update while the replacement is being built
+        // (previously its handlers stayed attached and could race the new one).
+        disposeSocket(existing.sock);
         try {
           await existing.sock.end(void 0);
         } catch (_) {

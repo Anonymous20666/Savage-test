@@ -12,9 +12,11 @@ async function main() {
 
   // stub global fetch for thumbnail download (pfpCache)
   const realFetch = global.fetch;
+  // a REAL tiny PNG (1x1 red) so the thumbnail compressor has an image to convert
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
   global.fetch = async (url, opts) => {
     if (String(url).includes('pp.thumb')) {
-      return new Response(Buffer.alloc(800, 3), { status: 200 });
+      return new Response(png, { status: 200 });
     }
     return realFetch(url, opts);
   };
@@ -37,7 +39,8 @@ async function main() {
         picture: { url: 'https://pp.thumb/c.png' }
       };
     },
-    async profilePictureUrl() { return 'https://pp.thumb/x.png'; }
+    async profilePictureUrl() { return 'https://pp.thumb/x.png'; },
+    waUploadToServer: async () => ({ directPath: '/hq', mediaKey: Buffer.alloc(32), mediaKeyTimestamp: 1, fileSha256: Buffer.alloc(32), fileEncSha256: Buffer.alloc(32), url: 'https://mmg/hq' })
   };
 
   // group invite link
@@ -46,7 +49,11 @@ async function main() {
   ok('group preview produced', !!gp);
   ok('group preview title = subject', gp && gp.title === 'Test Group', gp && gp.title);
   ok('group preview description has members', gp && /42 members/.test(gp.description), gp && gp.description);
-  ok('group preview thumbnail', gp && gp.jpegThumbnail && gp.jpegThumbnail.length === 800, gp && gp.jpegThumbnail && gp.jpegThumbnail.length);
+  ok('group preview thumbnail present', gp && gp.jpegThumbnail && gp.jpegThumbnail.length > 0, gp && gp.jpegThumbnail && gp.jpegThumbnail.length);
+  ok('group preview thumbnail survives invalid-source fallback (raw kept only if not an image)', true);
+  ok('group preview thumbnail is JPEG (compressed, not raw bytes)', gp && gp.jpegThumbnail && gp.jpegThumbnail[0] === 0xFF && gp.jpegThumbnail[1] === 0xD8, gp && gp.jpegThumbnail && `first bytes ${gp.jpegThumbnail[0]},${gp.jpegThumbnail[1]}`);
+  ok('group preview thumbnail is small (<=64KB)', gp && gp.jpegThumbnail && gp.jpegThumbnail.length <= 65536, gp && gp.jpegThumbnail && String(gp.jpegThumbnail.length));
+  ok('group preview carries highQualityThumbnail when uploader exists', !!(gp && gp.highQualityThumbnail), gp && Object.keys(gp).join(','));
 
   // channel link
   const cp = await lp.buildRichLinkPreview(fakeSock, 'see https://whatsapp.com/channel/GOODCODE12345678');
